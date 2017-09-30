@@ -64,4 +64,5 @@ dependencies {
     compile("org.apache.curator:curator-recipes:$curatorVersion") {
         exclude group: "org.apache.zookeeper", module: "zookeeper"
     }
+    compile "io.nats:jnats:1.0"
 }

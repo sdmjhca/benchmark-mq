@@ -10,9 +10,12 @@
           http://www.springframework.org/schema/task
           http://www.springframework.org/schema/task/spring-task-4.0.xsd">
     <context:annotation-config/>
-    <context:component-scan base-package="com.xxx"/>
+    <context:component-scan base-package="com.xxx.client"/>
+    <context:component-scan base-package="com.xxx.demons.netsmessage"/>
+    <context:component-scan base-package="com.xxx.util"/>
     <task:annotation-driven/>
 
     <bean id="vertx" factory-bean="vertxFactory" factory-method="createVertx"/>
-    <bean id="rabbitConnection" factory-bean="rabbitMQFactory" factory-method="createConnection"/>
+    <!--<bean id="rabbitConnection" factory-bean="rabbitMQFactory" factory-method="createConnection"/>-->
+    <bean id="natsConnection" factory-bean="natsFactory" factory-method="createConnection"/>
 </beans>
