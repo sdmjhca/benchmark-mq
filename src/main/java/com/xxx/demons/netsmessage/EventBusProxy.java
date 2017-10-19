@@ -7,7 +7,6 @@ import java.util.UUID;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
-import io.nats.client.AsyncSubscription;
 import io.nats.client.Connection;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Context;
@@ -118,8 +117,7 @@ public class EventBusProxy implements EventBus {
     public <T> MessageConsumer<T> consumer(String address, Handler<Message<T>> handler) {
         try {
             Context runContext = vertx.getOrCreateContext();
-
-            AsyncSubscription subscribe = connection.subscribe(address, cb -> {
+            Consumer<io.nats.client.Message> consumer = cb -> {
                 String s = new String(cb.getData());
                 log.debug("eventbus  consumer msg {} ", s);
                 String[] split = s.split("#");
@@ -131,9 +129,9 @@ public class EventBusProxy implements EventBus {
                 };
                 Message message = new MessageProxy(split[1], replyHandler, failedHandler);
                 runContext.runOnContext(r -> handler.handle(message));
-            });
-
-            return new MessageConsumerProxy(subscribe);
+            };
+            Runnable unSubscribe = receiverPoint.subscribe(vertx, address, consumer);
+            return new MessageConsumerProxy(unSubscribe);
         } catch (Exception e) {
             log.error("", e);
             throw new RuntimeException(e.getMessage());

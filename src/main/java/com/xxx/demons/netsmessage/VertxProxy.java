@@ -1,7 +1,9 @@
 package com.xxx.demons.netsmessage;
 
 
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import io.nats.client.Connection;
 import io.netty.channel.EventLoopGroup;
@@ -35,6 +37,7 @@ public class VertxProxy implements Vertx {
     private Connection connection;
     private ReceiverPoint receiverPoint;
     private ThreadLocal<EventBusProxy> eventBus = new ThreadLocal<>();
+    private Map<String, EventBusProxy> eventBusPool = new ConcurrentHashMap<>();
 
     public VertxProxy(Vertx vertx, Connection connection, ReceiverPoint receiverPoint) {
         this.vertx = vertx;
@@ -115,9 +118,15 @@ public class VertxProxy implements Vertx {
 
     @Override
     public EventBus eventBus() {
-        if (eventBus.get() == null)
-            eventBus.set(new EventBusProxy(vertx, connection, receiverPoint));
-        return eventBus.get();
+        String deploymentID = vertx.getOrCreateContext().deploymentID();
+        if (deploymentID == null) {
+            if (eventBus.get() == null)
+                eventBus.set(new EventBusProxy(vertx, connection, receiverPoint));
+            return eventBus.get();
+        } else {
+            eventBusPool.computeIfAbsent(deploymentID, k -> new EventBusProxy(vertx, connection, receiverPoint));
+            return eventBusPool.get(deploymentID);
+        }
     }
 
     @Override

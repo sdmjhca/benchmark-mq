@@ -12,6 +12,7 @@ public class Receiver extends AbstractVerticle {
     public String address;
     private Vertx vertx;
 
+    private long lastPush;
 
     public Receiver(Vertx vertx, int index) {
         this.vertx = vertx;
@@ -23,12 +24,21 @@ public class Receiver extends AbstractVerticle {
     @Override
     public void start() throws Exception {
         vertx.eventBus().consumer(address, this::onMessage);
+        vertx.eventBus().consumer(Pusher.ADDRESS, this::onPush);
+        log.debug("receiver {} started", index);
     }
 
-    public void onMessage(Message<String> message) {
+    private void onMessage(Message<String> message) {
 //        log.debug("{} receive {}", name, message.body());
         Starter.receiverMeter.mark();
         message.reply("ok");
+    }
+
+    private void onPush(Message<String> message) {
+        long push = Long.parseLong(message.body());
+        if (push - lastPush != 1) log.debug("{} push lost {}->>{}", index, lastPush, push);
+        lastPush = push;
+        Starter.pushReceiveMeter.mark();
     }
 
     public static String buildAddress(int index) {

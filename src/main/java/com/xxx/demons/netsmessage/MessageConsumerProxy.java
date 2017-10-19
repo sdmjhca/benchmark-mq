@@ -1,8 +1,5 @@
 package com.xxx.demons.netsmessage;
 
-import java.io.IOException;
-
-import io.nats.client.AsyncSubscription;
 import io.vertx.core.Handler;
 import io.vertx.core.eventbus.MessageConsumer;
 import io.vertx.core.streams.ReadStream;
@@ -10,10 +7,10 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class MessageConsumerProxy implements MessageConsumer {
-    private AsyncSubscription subscribe;
+    private Runnable unSubscribe;
 
-    public MessageConsumerProxy(AsyncSubscription subscribe) {
-        this.subscribe = subscribe;
+    public MessageConsumerProxy(Runnable unSubscribe) {
+        this.unSubscribe = unSubscribe;
     }
 
     @Override
@@ -63,12 +60,7 @@ public class MessageConsumerProxy implements MessageConsumer {
 
     @Override
     public void unregister() {
-        try {
-            subscribe.unsubscribe();
-        } catch (IOException e) {
-            log.error("", e);
-            throw new RuntimeException(e.getMessage());
-        }
+        unSubscribe.run();
     }
 
     @Override

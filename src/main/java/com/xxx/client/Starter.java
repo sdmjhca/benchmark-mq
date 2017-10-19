@@ -15,6 +15,7 @@ import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 
 import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import lombok.extern.slf4j.Slf4j;
 
@@ -38,24 +39,37 @@ public class Starter extends AbstractVerticle {
     public static Meter senderMeter = metrics.meter("sender");
     public static Meter receiverMeter = metrics.meter("receiver");
     public static Meter replyMeter = metrics.meter("reply");
+    public static Meter pushMeter = metrics.meter("push");
+    public static Meter pushReceiveMeter = metrics.meter("pushReceive");
 
     @PostConstruct
     public void initialize() throws MQClientException {
+
+        Future<Void> future = Future.succeededFuture();
         if (MODE.equals("both") || MODE.equals("receiver")) {
             for (int i = 0; i < RECEIVER_COUNT; i++) {
                 Receiver receiver = new Receiver(vertx, i);
-                vertx.deployVerticle(receiver, r -> LogHelper.deploying(receiver.name, r, log));
+                Future<String> f = Future.future();
+                vertx.deployVerticle(receiver, f.completer());
+                future = future.compose(r -> f).map(r -> null);
             }
+        }
+        if (MODE.equals("both") || MODE.equals("pusher")) {
+            Pusher pusher = new Pusher(vertx);
+            vertx.deployVerticle(pusher, r -> LogHelper.deploying("pusher", r, log));
         }
         if (MODE.equals("both") || MODE.equals("sender")) {
             int count = SEND_SPEED / PARALLELISM;
-            vertx.setTimer(3000, l -> {
+            future.map(v -> {
                 for (int i = 0; i < PARALLELISM; i++) {
                     Sender sender = new Sender(vertx, i);
                     vertx.deployVerticle(sender, r -> LogHelper.deploying(sender.name, r, log));
                 }
-                vertx.setPeriodic(1000, t -> vertx.eventBus().publish(Sender.CMD_ADDRESS, String.valueOf(count)));
+                return null;
+            }).setHandler(r -> {
+                if (r.failed()) log.error("", r.cause());
             });
+            vertx.setPeriodic(1000, t -> vertx.eventBus().publish(Sender.CMD_ADDRESS, String.valueOf(count)));
         }
         startReport();
     }
