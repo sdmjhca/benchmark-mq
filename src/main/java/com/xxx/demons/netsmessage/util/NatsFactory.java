@@ -20,11 +20,11 @@ public class NatsFactory {
 
     public ConnectionFactory create() {
         Properties properties = new Properties();
-        properties.setProperty(Nats.PROP_VERBOSE,"true");
-        properties.setProperty(Nats.PROP_URL,"nats://192.168.8.80:4222");
-        properties.setProperty(Nats.PROP_SERVERS,"nats://192.168.8.80:4222");
-        properties.setProperty(Nats.PROP_MAX_RECONNECT,"10000");
-        properties.setProperty(Nats.PROP_RECONNECT_WAIT,"2000");
+        properties.setProperty(Nats.PROP_VERBOSE, "true");
+        properties.setProperty(Nats.PROP_URL, "nats://192.168.8.81:4222");
+        properties.setProperty(Nats.PROP_SERVERS, "nats://192.168.8.81:4222");
+        properties.setProperty(Nats.PROP_MAX_RECONNECT, "10000");
+        properties.setProperty(Nats.PROP_RECONNECT_WAIT, "2000");
 //        ConnectionFactory cf = new ConnectionFactory("nats://172.31.28.84:4224");
         ConnectionFactory cf = new ConnectionFactory(properties);
         return cf;

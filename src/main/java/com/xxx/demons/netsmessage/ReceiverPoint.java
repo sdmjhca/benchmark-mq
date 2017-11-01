@@ -26,51 +26,99 @@ import lombok.extern.slf4j.Slf4j;
 public class ReceiverPoint {
     @Resource
     private Connection natsConnection;
-    public String replyQueueName;
+    String replyAddress;
 
-    public final Map<String, Handler> replyHandlers = new ConcurrentHashMap<>();
-    public final Map<String, Map<String, Consumer<io.nats.client.Message>>> consumerHandlers = new ConcurrentHashMap<>();
+    private Vertx vertx = Vertx.vertx();
 
-    public <T> void putHandler(String key, Handler<AsyncResult<Message<T>>> handler) {
-        replyHandlers.put(key, handler);
+    private final long PERIODIC_RETRY_TIME = 5000L;
+    private final Map<Long, RetryContext> retrySendHandlers = new ConcurrentHashMap<>();
+
+    private final Map<Long, Handler> replyHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Consumer<io.nats.client.Message>>> consumerHandlers = new ConcurrentHashMap<>();
+
+    <T> void putHandler(long seq, Handler<AsyncResult<Message<T>>> handler, Runnable retry, Runnable complete) {
+        replyHandlers.put(seq, handler);
+        retrySendHandlers.put(seq, new RetryContext(seq, retry, complete));
+    }
+
+    void putRetryReply(long seq, Runnable retry) {
+        retrySendHandlers.put(seq, new RetryContext(seq, retry));
+    }
+
+    public static class RetryContext {
+        long seq;
+        long timestamp;
+        Runnable retry;
+        Runnable complete;
+        private int times;
+
+        void retry() {
+            log.warn("{} retry times {}", seq, ++times);
+            retry.run();
+        }
+
+        RetryContext(long seq, Runnable retry) {
+            this.seq = seq;
+            this.timestamp = System.currentTimeMillis();
+            this.retry = retry;
+        }
+
+
+        RetryContext(long seq, Runnable retry, Runnable complete) {
+            this.seq = seq;
+            this.timestamp = System.currentTimeMillis();
+            this.retry = retry;
+            this.complete = complete;
+        }
     }
 
     @PostConstruct
     public void initialize() throws IOException {
-        replyQueueName = UUID.randomUUID().toString();
-        natsConnection.subscribe(replyQueueName, cb -> {
-            log.debug("rec msg {}", cb.getData());
-            String s = new String(cb.getData());
-            String[] split = s.split("#");
-            String successTag = split[0];
-            String seqTag = split[1];
-            replyHandlers.computeIfPresent(seqTag, (seq, handler) -> {
-                if ("0".equals(successTag)) {
-                    String body = "";
-                    if (split.length == 3) body = split[2];
-                    Message<String> message = new MessageProxy(body);
-                    handler.handle(Future.succeededFuture(message));
-                } else if ("1".equals(successTag)) {
-                    int code = Integer.parseInt(split[2]);
-                    String msg = split[3];
-                    handler.handle(Future.failedFuture(new ReplyException(ReplyFailure.RECIPIENT_FAILURE, code, msg)));
-                }
-                return null;
-            });
+        replyAddress = UUID.randomUUID().toString();
+        vertx.setPeriodic(PERIODIC_RETRY_TIME, l -> doRetrySend());
+        natsConnection.subscribe(replyAddress, cb -> {
+            MsgCodec decode = MsgCodec.decode(cb.getData());
+            if (decode.isAck) {
+                log.debug("receive ACK {}", decode);
+                RetryContext remove = retrySendHandlers.remove(decode.ackSeq);
+                if (remove != null && remove.complete != null) remove.complete.run();
+            } else {
+                log.debug("receive msg {}", decode);
+                String replyTo = cb.getReplyTo();
+                //reply ACK
+                SendHelper.publish(natsConnection, replyTo, MsgCodec.encodeAck(decode.ackSeq));
+                boolean successTag = decode.success;
+                replyHandlers.computeIfPresent(decode.seq, (seq, handler) -> {
+                    if (successTag) {
+                        Message<String> message = new MessageProxy(decode.body);
+                        handler.handle(Future.succeededFuture(message));
+                    } else {
+                        int code = decode.code;
+                        String msg = decode.body;
+                        handler.handle(Future.failedFuture(new ReplyException(ReplyFailure.RECIPIENT_FAILURE, code, msg)));
+                    }
+                    return null;
+                });
+            }
         });
     }
 
-    public Runnable subscribe(Vertx vertx, String address, Consumer<io.nats.client.Message> handler) {
-        String deploymentID = vertx.getOrCreateContext().deploymentID();
-        if (deploymentID == null) deploymentID = UUID.randomUUID().toString();
+    private void doRetrySend() {
+        long now = System.currentTimeMillis();
+        retrySendHandlers.values().stream()
+                .filter(c -> (now - c.timestamp) > PERIODIC_RETRY_TIME)
+                .forEach(RetryContext::retry);
+    }
+
+    Runnable subscribe(String address, Consumer<io.nats.client.Message> handler) {
+        String uniqueID = UUID.randomUUID().toString();
         consumerHandlers.computeIfAbsent(address, k -> {
             Map<String, Consumer<io.nats.client.Message>> handlerMap = new ConcurrentHashMap<>();
             natsConnection.subscribe(address, cb -> handlerMap.values().forEach(h -> h.accept(cb)));
             return handlerMap;
         });
         Map<String, Consumer<io.nats.client.Message>> handlerMap = consumerHandlers.get(address);
-        handlerMap.putIfAbsent(deploymentID, handler);
-        String finalDeploymentID = deploymentID;
-        return () -> handlerMap.remove(finalDeploymentID);
+        handlerMap.putIfAbsent(uniqueID, handler);
+        return () -> handlerMap.remove(uniqueID);
     }
 }

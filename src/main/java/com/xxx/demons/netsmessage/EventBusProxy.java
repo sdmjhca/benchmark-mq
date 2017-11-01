@@ -1,15 +1,19 @@
 package com.xxx.demons.netsmessage;
 
 
+import com.xxx.util.ConcurrentQueue;
+
 import java.io.IOException;
-import java.nio.charset.Charset;
-import java.util.UUID;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import io.nats.client.Connection;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Context;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.eventbus.DeliveryOptions;
@@ -25,23 +29,55 @@ import lombok.extern.slf4j.Slf4j;
 public class EventBusProxy implements EventBus {
     private Vertx vertx;
     private Connection connection;
-    private ReceiverPoint receiverPoint;
+    private ReceiverPoint point;
+    private static AtomicLong seqInc = new AtomicLong(1000);
+    private final static Map<String, ConcurrentQueue<Void>> queueMap = new ConcurrentHashMap<>();
+    private final static Map<String, Long> ackRecords = new ConcurrentHashMap<>();
 
-    public EventBusProxy(Vertx vertx, Connection connection, ReceiverPoint receiverPoint) {
-        this.vertx = vertx;
-        this.connection = connection;
-        this.receiverPoint = receiverPoint;
+    private <T> EventBus sendCommon(String address, Object message, Handler<AsyncResult<Message<T>>> replyHandler) {
+        Future<Void> trigger = Future.future();
+
+        trigger.map(v -> {
+            Context runContext = vertx.getOrCreateContext();
+            long seqNum = seqInc.incrementAndGet();
+            byte[] bytes = MsgCodec.encode(seqNum, seqNum, message.toString());
+            Runnable retry = () -> {
+                log.warn("event bus retry send {} msg seq {} body {} msg size {} and should reply {}", address, seqNum, message, bytes.length,
+                        point.replyAddress);
+                SendHelper.publish(connection, address, point.replyAddress, bytes);
+            };
+            if (replyHandler != null) {
+                Handler<AsyncResult<Message<T>>> receiveHandler = async -> runContext.runOnContext(r -> replyHandler.handle(async));
+                point.putHandler(seqNum, receiveHandler, retry, () -> queueMap.get(address).take());
+            }
+            log.debug("event bus send {} msg seq {} body {} msg size {} and should reply {}", address, seqNum, message, bytes.length,
+                    point.replyAddress);
+            SendHelper.publish(connection, address, point.replyAddress, bytes);
+            return null;
+        });
+        queueMap.computeIfAbsent(address, k -> new ConcurrentQueue<>(vertx));
+        queueMap.get(address).executeOrPend(trigger);
+        return this;
     }
 
 
-    public void reply(String replyTo, String replyMsg) {
+    private EventBus publishCommon(String address, Object message) {
         try {
-            connection.publish(replyTo, replyMsg.getBytes());
-            log.debug("eventbus reply msg {} and to {}", replyMsg, replyTo);
+            long seqNum = seqInc.incrementAndGet();
+            byte[] bytes = MsgCodec.encode(seqNum, seqNum, message.toString(), true);
+            connection.publish(address, point.replyAddress, bytes);
+            log.debug("event bus publish {} msg {}", address, message.toString());
+            return this;
         } catch (IOException e) {
-            log.error("error ", e);
+            log.error("", e);
             throw new RuntimeException(e.getMessage());
         }
+    }
+
+    public EventBusProxy(Vertx vertx, Connection connection, ReceiverPoint point) {
+        this.vertx = vertx;
+        this.connection = connection;
+        this.point = point;
     }
 
     @Override
@@ -52,27 +88,6 @@ public class EventBusProxy implements EventBus {
     @Override
     public <T> EventBus send(String address, Object message, Handler<AsyncResult<Message<T>>> replyHandler) {
         return sendCommon(address, message, replyHandler);
-    }
-
-    private <T> EventBus sendCommon(String address, Object message, Handler<AsyncResult<Message<T>>> replyHandler) {
-        Context runContext = vertx.getOrCreateContext();
-        try {
-            String corrId = UUID.randomUUID().toString();
-            if (replyHandler != null) {
-                Handler<AsyncResult<Message<T>>> receiveHandler = async -> {
-                    runContext.runOnContext(r -> replyHandler.handle(async));
-                };
-                receiverPoint.putHandler(corrId, receiveHandler);
-            }
-            byte[] bytes = (corrId + "#" + message).getBytes();
-            log.debug("eventbus send msg body {} msg size {} and should reply {}", new String((corrId + "#" + message).getBytes()), bytes.length,
-                    receiverPoint.replyQueueName);
-            connection.publish(address, receiverPoint.replyQueueName, (corrId + "#" + message).getBytes());
-            return this;
-        } catch (IOException e) {
-            log.error("", e);
-            throw new RuntimeException(e.getMessage());
-        }
     }
 
     @Override
@@ -95,18 +110,6 @@ public class EventBusProxy implements EventBus {
         return publishCommon(address, message);
     }
 
-    public EventBus publishCommon(String address, Object message) {
-        try {
-            String corrId = UUID.randomUUID().toString();
-            connection.publish(address, receiverPoint.replyQueueName, (corrId + "#" + message).toString().getBytes(Charset
-                    .defaultCharset()));
-            log.debug("eventbus send msg {}", (corrId + "#" + message).toString());
-            return this;
-        } catch (IOException e) {
-            log.error("", e);
-            throw new RuntimeException(e.getMessage());
-        }
-    }
 
     @Override
     public <T> MessageConsumer<T> consumer(String address) {
@@ -115,27 +118,52 @@ public class EventBusProxy implements EventBus {
 
     @Override
     public <T> MessageConsumer<T> consumer(String address, Handler<Message<T>> handler) {
-        try {
-            Context runContext = vertx.getOrCreateContext();
-            Consumer<io.nats.client.Message> consumer = cb -> {
-                String s = new String(cb.getData());
-                log.debug("eventbus  consumer msg {} ", s);
-                String[] split = s.split("#");
-                Consumer<String> replyHandler = msg -> {
-                    reply(cb.getReplyTo(), "0" + "#" + split[0] + "#" + msg);
-                };
-                BiConsumer<Integer, String> failedHandler = (code, msg) -> {
-                    reply(cb.getReplyTo(), "1" + "#" + split[0] + "#" + code + "#" + msg);
-                };
-                Message message = new MessageProxy(split[1], replyHandler, failedHandler);
+        Context runContext = vertx.getOrCreateContext();
+        Consumer<io.nats.client.Message> consumer = cb -> {
+            String replyTo = cb.getReplyTo();
+            MsgCodec decode = MsgCodec.decode(cb.getData());
+            String body = decode.body;
+            if (decode.isPublish) {
+                Message message = new MessageProxy(body, null, null);
                 runContext.runOnContext(r -> handler.handle(message));
-            };
-            Runnable unSubscribe = receiverPoint.subscribe(vertx, address, consumer);
-            return new MessageConsumerProxy(unSubscribe);
-        } catch (Exception e) {
-            log.error("", e);
-            throw new RuntimeException(e.getMessage());
-        }
+            } else {
+                String ackKey = SendHelper.buildAckKey(replyTo, address);
+                Long lastAck = ackRecords.getOrDefault(ackKey, -1L);
+                Long currentAck = decode.ackSeq;
+                //reply ACK
+                SendHelper.publish(connection, replyTo, MsgCodec.encodeAck(currentAck));
+                if (currentAck > lastAck) {
+                    ackRecords.put(ackKey, currentAck);
+                    log.debug("event bus {} consumer msg {} ", address, decode);
+                    long seq = decode.seq;
+                    long replyAck = seqInc.incrementAndGet();
+                    Consumer<String> replyHandler = msg -> {
+                        log.debug("event bus {} reply success seq {} content {} to {}", address, seq, msg, replyTo);
+                        byte[] bytes = MsgCodec.encode(replyAck, seq, msg);
+                        SendHelper.publish(connection, replyTo, point.replyAddress, bytes);
+                        point.putRetryReply(replyAck, () -> {
+                            log.warn("event bus retry {} reply success seq {} content {} to {}", address, seq, msg, replyTo);
+                            SendHelper.publish(connection, replyTo, point.replyAddress, bytes);
+                        });
+                    };
+                    BiConsumer<Integer, String> failedHandler = (code, msg) -> {
+                        log.debug("event bus {} reply failed seq {} code {} content {} to {}", address, seq, code, msg, replyTo);
+                        byte[] bytes = MsgCodec.encode(replyAck, seq, code, msg);
+                        SendHelper.publish(connection, replyTo, point.replyAddress, bytes);
+                        point.putRetryReply(replyAck, () -> {
+                            log.warn("event bus retry {} reply failed seq {} code {} content {} to {}", address, seq, code, msg, replyTo);
+                            SendHelper.publish(connection, replyTo, point.replyAddress, bytes);
+                        });
+                    };
+                    Message message = new MessageProxy(body, replyHandler, failedHandler);
+                    runContext.runOnContext(r -> handler.handle(message));
+                } else {
+                    log.warn("event bus {} ignore message {} currentAck:{}->lastAck:{}", address, decode, currentAck, lastAck);
+                }
+            }
+        };
+        Runnable unSubscribe = point.subscribe(address, consumer);
+        return new MessageConsumerProxy(unSubscribe);
     }
 
     @Override
